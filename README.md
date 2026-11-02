@@ -83,15 +83,6 @@ le badge « Nouveau » pendant 30 jours, et les images déjà préparées, qui s
 - L'application ne contacte que les plateformes concernées et SteamGridDB (si activé).
 - Les pages générées contiennent la liste de tes jeux, mais aucun identifiant ni jeton.
 
-## NixOS
-
-```bash
-nix-shell        # utilise shell.nix : Python avec Pillow, certificats, xdg-utils
-python3 gog_library.py
-```
-
-En cas de problème de connexion : `python3 gog_library.py --diagnostic`.
-
 ## Limites
 
 - Utilise les API non documentées de GOG et d'Epic Games (comme Heroic ou Legendary) : elles peuvent changer.
