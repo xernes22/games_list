@@ -20,6 +20,7 @@ d'« ancien fichier » à la génération suivante. Seuls les jetons de connexio
 import argparse
 import base64
 import difflib
+import hashlib
 import html
 import io
 import json
@@ -33,6 +34,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 import zlib
 import urllib.error
 import urllib.request
@@ -41,35 +43,35 @@ try:
 except ImportError:  # Python compilé sans OpenSSL (ex. python3Minimal) : module _ssl absent
     ssl = None
 import webbrowser
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-# --- Numérotation : MAJEUR.MINEUR.CORRECTIF (+ numéro de build = nombre de versions du programme)
-#   MAJEUR     : changement qui modifie le format des pages générées ou le fonctionnement de base
-#   MINEUR     : nouvelle fonctionnalité visible
-#   CORRECTIF  : correction sans nouvelle fonctionnalité
-#   BUILD      : +1 à chaque nouvelle version livrée, quelle qu'elle soit (v17 = 17e version)
-# Historique :
-#   0.1  gog_to_html.py : page hors ligne des jaquettes GOG        0.2  cache + badge « Nouveau »
-#   1.0  application avec interface locale (GOG)                   1.1  dossier Téléchargements, liens
-#   1.2  Epic Games                                                1.3  fusion des doublons, choix du site
-#   1.4  vérification des connexions au démarrage                  1.5  Steam, listes Ubisoft / Prime
-#   1.6  NixOS : certificats SSL, diagnostic, secours curl
-#   2.0  plus de base locale (historique dans la page), SteamGridDB, images réduites en base64
-#   2.1  panneaux connexions / listes, correctif réutilisation     2.2  conversion WebP multi-outils
-#   2.3  interface en deux colonnes responsive                     2.4  pages par plateforme
-#   2.5  deux cases : fichier unique / fichier par plateforme
-#   2.5.1  documentation de l'en-tête, import inutilisé retiré
-VERSION = "2.5.1"
-BUILD = 18
-FORMAT = 3  # version du format des données intégrées dans les pages (change avec un MAJEUR)
+# --- Numérotation : « vN.NN » (v0.26, v0.27, …). Le nombre augmente de 1 à chaque version livrée,
+# qu'il s'agisse d'une nouveauté ou d'une correction. v0.25 est la version de référence
+# (c'est l'ancienne « 2.5.0 »). Historique :
+#   anciennes versions (ancien format MAJEUR.MINEUR.CORRECTIF) :
+#     0.1  gog_to_html.py : page hors ligne des jaquettes GOG        0.2  cache + badge « Nouveau »
+#     1.0  application avec interface locale (GOG)                   1.1  dossier Téléchargements, liens
+#     1.2  Epic Games                                                1.3  fusion des doublons, choix du site
+#     1.4  vérification des connexions au démarrage                  1.5  Steam, listes Ubisoft / Prime
+#     1.6  NixOS : certificats SSL, diagnostic, secours curl
+#     2.0  plus de base locale (historique dans la page), SteamGridDB, images réduites en base64
+#     2.1  panneaux connexions / listes, correctif réutilisation     2.2  conversion WebP multi-outils
+#     2.3  interface en deux colonnes responsive                     2.4  pages par plateforme
+#   nouveau format :
+#     v0.25  (ex-2.5.0) deux cases : fichier unique / par plateforme, version affichée   <- RÉFÉRENCE
+#     v0.26  nouveau format de numérotation, documentation de l'en-tête, import inutilisé retiré
+#     v0.27  Ubisoft Connect et Prime Gaming par connexion (méthode de Lutris), liste manuelle en secours
+VERSION = "0.27"
+FORMAT = 3  # version du format des données intégrées dans les pages (indépendante du numéro de version)
 
 
 def version_label():
-    return f"{VERSION} (build {BUILD})"
+    return f"v{VERSION}"
 
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "gog-bibliotheque"
@@ -181,7 +183,7 @@ def _curl_quote(v):
             .replace("\n", "\\n").replace("\r", "\\r") + '"')
 
 
-def _curl_request(url, headers, data, timeout):
+def _curl_request(url, headers, data, timeout, method=None):
     """Requête HTTPS via curl (secours si Python n'a pas SSL). Même comportement que urllib :
     lève HTTPError pour un statut >= 400 et URLError pour une panne réseau.
     La configuration passe par l'entrée standard : jetons et clés restent hors de `ps`."""
@@ -190,6 +192,8 @@ def _curl_request(url, headers, data, timeout):
     cfg += [f"header = {_curl_quote(f'{k}: {v}')}" for k, v in headers.items()]
     if data is not None:
         cfg.append(f"data = {_curl_quote(data)}")
+    if method in ("PUT", "DELETE", "PATCH"):
+        cfg.append(f"request = {_curl_quote(method)}")
     try:
         r = subprocess.run([CURL, "--config", "-"], input="\n".join(cfg).encode(),
                            capture_output=True, timeout=timeout + 10)
@@ -228,6 +232,26 @@ def http_post(url, data, headers=None, timeout=25):
     req = urllib.request.Request(url, data=urlencode(data).encode(), headers=h, method="POST")
     with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as r:
         return r.read()
+
+
+def http_json(method, url, obj=None, headers=None, timeout=25):
+    """Requête JSON (GET, POST ou PUT) ; retourne la réponse décodée ({} si elle est vide).
+    Lève HTTPError (statut >= 400) ou URLError (panne réseau)."""
+    h = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    h.update(headers or {})
+    body = None if obj is None else json.dumps(obj)
+    if body is not None:
+        h.setdefault("Content-Type", "application/json")
+    if ssl is None:
+        if not CURL:
+            raise urllib.error.URLError(NO_TLS_HELP)
+        raw = _curl_request(url, h, body, timeout, method=method)
+    else:
+        data = body.encode() if body is not None else (b"" if method in ("POST", "PUT") else None)
+        req = urllib.request.Request(url, data=data, headers=h, method=method)
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as r:
+            raw = r.read()
+    return json.loads(raw) if raw.strip() else {}
 
 
 def write_private(path, obj):
@@ -383,9 +407,14 @@ class Store:
     steps = []
     fields = []
     service = False         # True : service annexe (images), pas une boutique
+    has_list = False        # True : la plateforme accepte aussi une liste manuelle
+    snippet = ""            # script à coller dans la console du navigateur (connexion par copie)
 
     def count(self):
         return 0
+
+    def connected(self):
+        return self.logged_in()
 
     def __init__(self):
         self._lock = threading.RLock()  # évite deux rafraîchissements simultanés
@@ -406,7 +435,7 @@ class Store:
 
     def check(self):
         """État de la connexion : none / ok / expired / offline."""
-        if not self.logged_in():
+        if not self.connected():
             return {"state": "none"}
         try:
             return {"state": "ok", "user": self.verify()}
@@ -431,11 +460,11 @@ class Store:
             pass
 
     def info(self):
-        return {"id": self.id, "name": self.name, "logged": self.logged_in(),
-                "auth_url": self.auth_url, "steps": self.steps,
+        return {"id": self.id, "name": self.name, "logged": self.connected(),
+                "usable": self.logged_in(), "auth_url": self.auth_url, "steps": self.steps,
                 "placeholder": self.placeholder, "kind": self.kind,
                 "fields": self.fields, "help": self.help, "count": self.count(),
-                "service": self.service}
+                "service": self.service, "has_list": self.has_list, "snippet": self.snippet}
 
 
 # ---- GOG (client public GOG Galaxy, comme Heroic / Minigalaxy)
@@ -781,9 +810,11 @@ class SteamStore(Store):
         return games
 
 
-# ---- Listes manuelles (Ubisoft Connect, Prime Gaming : pas d'accès public à ces comptes)
-class ManualStore(Store):
-    kind = "manual"
+# ---- Plateformes à liste manuelle et/ou connexion (Ubisoft Connect, Prime Gaming)
+class ListMixin:
+    """Liste de jeux saisie à la main (« Titre | lien | image »), conservée dans la page HTML.
+    Pour Ubisoft et Prime Gaming, elle sert de secours ou de complément à la connexion."""
+    has_list = True
     help = ""
 
     def read_text(self):
@@ -812,17 +843,14 @@ class ManualStore(Store):
     def count(self):
         return len(self.parse())
 
+    def connected(self):
+        """Connexion active (jetons présents) ; pour une liste seule : liste non vide."""
+        return self.tokens_path.exists() if self.token_file else self.count() > 0
+
     def logged_in(self):
-        return self.count() > 0
+        return self.connected() or self.count() > 0
 
-    def logout(self):
-        pass
-
-    def check(self):
-        n = self.count()
-        return {"state": "ok", "user": f"{n} jeux"} if n else {"state": "none"}
-
-    def fetch(self, progress):
+    def list_games(self, progress):
         items = self.parse()
         cache = CTX["lookup"]
         todo = [i for i in items if not i["image"] and norm_title(i["title"]) not in cache]
@@ -861,22 +889,368 @@ class ManualStore(Store):
                           "cover_base": base, "cover_urls": urls, "link": i["link"]})
         return games
 
+    def fetch(self, progress):
+        """Jeux de la connexion (si active) complétés par la liste manuelle (titres absents seulement)."""
+        api = []
+        self.src, self.last_warning = "list", ""
+        if self.connected():
+            try:
+                api = self.api_games(progress)
+                self.src = "api"
+            except NotLoggedIn:
+                if not self.count():
+                    raise
+                self.logout()
+                self.last_warning = f"{self.name} : session expirée, liste manuelle utilisée (reconnecte-toi)."
+        have = {norm_title(g["title"]) for g in api}
+        extra = [g for g in (self.list_games(progress) if self.count() else [])
+                 if norm_title(g["title"]) not in have]
+        return api + extra
 
-class UbisoftStore(ManualStore):
-    id, name, tag = "ubisoft", "Ubisoft Connect", "UBI"
-    help = ("Ubisoft n'offre pas d'accès public à ta bibliothèque. Copie ici les titres de tes "
-            "jeux Ubisoft Connect, un par ligne. Facultatif : ajoute après le titre un lien puis "
-            "une image, séparés par « | » (liens en https uniquement). "
-            "Exemple : Far Cry 6 | https://… | https://… "
-            "La liste est enregistrée dans la page HTML à la prochaine génération.")
+
+class ManualStore(ListMixin, Store):
+    """Plateforme sans connexion possible : uniquement une liste saisie à la main."""
+    kind = "manual"
+
+    def logout(self):
+        pass
+
+    def check(self):
+        n = self.count()
+        return {"state": "ok", "user": f"{n} jeux"} if n else {"state": "none"}
+
+    def fetch(self, progress):
+        self.src = "list"
+        return self.list_games(progress)
 
 
-class PrimeStore(ManualStore):
-    id, name, tag = "prime", "Prime Gaming", "PRIME"
-    help = ("Amazon n'offre pas d'accès public à tes jeux Prime Gaming. Copie ici les titres des "
-            "jeux que tu as réclamés, un par ligne. Facultatif : ajoute après le titre un lien "
-            "puis une image, séparés par « | » (liens en https uniquement). "
-            "La liste est enregistrée dans la page HTML à la prochaine génération.")
+# ---- Prime Gaming / Amazon Games : même méthode que l'application « Amazon Games »
+# (observée dans Lutris) : connexion Amazon, enregistrement d'un « appareil », lecture des droits d'accès.
+AMZ_API = "https://api.amazon.com"
+AMZ_ENTITLEMENTS = "https://gaming.amazon.com/api/distribution/entitlements"
+AMZ_UA = "com.amazon.agslauncher.win/3.0.9202.1"
+AMZ_DEVICE_TYPE = "A2UMVHOX7UP4V7"
+AMZ_TARGET = "com.amazon.animusdistributionservice.entitlement.AnimusEntitlementsService.GetEntitlements"
+AMZ_KEY_ID = "d5dc8b8b-86c8-4fc4-ae93-18c0def5314d"
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+class PrimeStore(ListMixin, Store):
+    id, name, tag, token_file = "prime", "Prime Gaming", "PRIME", "prime_tokens.json"
+    kind = "oauth"
+    placeholder = "https://www.amazon.com/?openid.oa2.authorization_code=…"
+    steps = ["Clique sur le bouton et connecte-toi à ton compte Amazon (celui de Prime Gaming).",
+             "Une page Amazon s'affiche ensuite : copie son adresse complète (Ctrl+L puis Ctrl+C). "
+             "Elle doit contenir « openid.oa2.authorization_code ».",
+             "Reviens ici et clique sur « Coller et valider » (ou Ctrl+V dans le champ). "
+             "Le code expire vite et ne sert qu'une fois."]
+    help = ("Liste de secours : un jeu par ligne (« Titre | lien | image », lien et image facultatifs). "
+            "Elle complète la connexion ou la remplace si elle est indisponible, et elle est enregistrée "
+            "dans la page HTML à la prochaine génération.")
+
+    def __init__(self):
+        super().__init__()
+        self._pending = None  # secrets de la connexion en cours (PKCE), gardés en mémoire seulement
+
+    def _pending_login(self):
+        if self._pending is None:
+            serial = uuid.uuid4().hex.upper()
+            self._pending = {"verifier": b64url(secrets.token_bytes(32)), "serial": serial,
+                             "client_id": f"{serial}#{AMZ_DEVICE_TYPE}".encode().hex()}
+        return self._pending
+
+    @property
+    def auth_url(self):
+        p = self._pending_login()
+        challenge = b64url(hashlib.sha256(p["verifier"].encode()).digest())
+        return "https://amazon.com/ap/signin?" + urlencode({
+            "openid.ns": "http://specs.openid.net/auth/2.0",
+            "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
+            "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
+            "openid.mode": "checkid_setup",
+            "openid.oa2.scope": "device_auth_access",
+            "openid.ns.oa2": "http://www.amazon.com/ap/ext/oauth/2",
+            "openid.oa2.response_type": "code",
+            "openid.oa2.code_challenge_method": "S256",
+            "openid.oa2.client_id": f"device:{p['client_id']}",
+            "language": "en_US",
+            "marketPlaceId": "ATVPDKIKX0DER",
+            "openid.return_to": "https://www.amazon.com",
+            "openid.pape.max_auth_age": 0,
+            "openid.assoc_handle": "amzn_sonic_games_launcher",
+            "pageId": "amzn_sonic_games_launcher",
+            "openid.oa2.code_challenge": challenge})
+
+    @staticmethod
+    def extract_code(text):
+        text = text.strip()
+        if "openid.oa2.authorization_code" in text:
+            q = parse_qs(urlparse(text).query)
+            return (q.get("openid.oa2.authorization_code") or [""])[0]
+        return text if re.fullmatch(r"[A-Za-z0-9_-]{16,}", text) else ""
+
+    def login(self, text):
+        code = self.extract_code(text)
+        if not code:
+            raise ValueError("Adresse non reconnue : elle doit contenir « openid.oa2.authorization_code ». "
+                             "Copie l'adresse complète de la page Amazon affichée après ta connexion.")
+        p = self._pending_login()
+        body = {"auth_data": {"authorization_code": code, "client_domain": "DeviceLegacy",
+                              "client_id": p["client_id"], "code_algorithm": "SHA-256",
+                              "code_verifier": p["verifier"], "use_global_authentication": False},
+                "registration_data": {"app_name": "AGSLauncher for Windows", "app_version": "1.0.0",
+                                      "device_model": "Windows", "device_name": None,
+                                      "device_serial": p["serial"], "device_type": AMZ_DEVICE_TYPE,
+                                      "domain": "Device", "os_version": "10.0.19044.0"},
+                "requested_extensions": ["customer_info", "device_info"],
+                "requested_token_type": ["bearer", "mac_dms"], "user_context_map": {}}
+        try:
+            res = http_json("POST", AMZ_API + "/auth/register", body,
+                            {"User-Agent": AMZ_UA, "Accept": "application/json", "Accept-Language": "en_US"})
+        except urllib.error.HTTPError as e:
+            raise ValueError(f"Connexion refusée par Amazon (HTTP {e.code}). Recommence la connexion : le code "
+                             "expire vite, ne sert qu'une fois et doit venir du lien affiché par l'application. "
+                             "Un compte d'une autre région qu'amazon.com peut aussi être refusé.") from e
+        except urllib.error.URLError as e:
+            raise ValueError("Connexion impossible : " + net_error(e, "Amazon")) from e
+        ok = (res.get("response") or {}).get("success")
+        if not ok or "tokens" not in ok:
+            raise ValueError("Réponse inattendue d'Amazon : la connexion n'a pas abouti.")
+        bearer, ext = ok["tokens"]["bearer"], ok.get("extensions") or {}
+        write_private(self.tokens_path, {
+            "access_token": bearer["access_token"], "refresh_token": bearer["refresh_token"],
+            "expires_at": time.time() + int(bearer.get("expires_in", 3600)),
+            "serial": (ext.get("device_info") or {}).get("device_serial_number") or p["serial"],
+            "name": (ext.get("customer_info") or {}).get("name", "")})
+        self._pending = None
+
+    def _refresh(self, refresh_token):
+        r = http_json("POST", AMZ_API + "/auth/token", {
+            "source_token": refresh_token, "source_token_type": "refresh_token",
+            "requested_token_type": "access_token", "app_name": "AGSLauncher for Windows",
+            "app_version": "1.0.0"}, {"User-Agent": AMZ_UA, "Accept": "application/json",
+                                      "Accept-Language": "en_US"})
+        t = json.loads(self.tokens_path.read_text("utf-8"))
+        t["access_token"] = r["access_token"]
+        t["expires_at"] = time.time() + int(r.get("expires_in", 3600))
+        write_private(self.tokens_path, t)
+
+    def verify(self):
+        token = self.access_token()
+        try:
+            d = http_json("GET", AMZ_API + "/user/profile", None,
+                          {"Authorization": "bearer " + token, "User-Agent": AMZ_UA, "Accept": "application/json"})
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise NotLoggedIn() from e
+            raise
+        return d.get("name", "") if isinstance(d, dict) else ""
+
+    def api_games(self, progress):
+        token = self.access_token()
+        serial = json.loads(self.tokens_path.read_text("utf-8"))["serial"]
+        headers = {"X-Amz-Target": AMZ_TARGET, "x-amzn-token": token, "User-Agent": AMZ_UA,
+                   "Content-Type": "application/json", "Content-Encoding": "amz-1.0"}
+        by_asin, next_token, total = defaultdict(list), None, 0
+        while True:
+            body = {"Operation": "GetEntitlements", "clientId": "Sonic", "syncPoint": None,
+                    "nextToken": next_token, "maxResults": 50, "productIdFilter": None,
+                    "keyId": AMZ_KEY_ID, "hardwareHash": hashlib.sha256(serial.encode()).hexdigest().upper()}
+            try:
+                d = http_json("POST", AMZ_ENTITLEMENTS, body, headers)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    raise NotLoggedIn() from e
+                raise
+            for ent in d.get("entitlements", []):
+                product = ent.get("product") or {}
+                if "id" in product and product.get("title"):
+                    by_asin[product.get("asin") or ""].append(ent)
+                    total += 1
+            progress("Prime Gaming : lecture de la bibliothèque", total, 0)
+            next_token = d.get("nextToken")
+            if not next_token:
+                break
+        # un même jeu peut avoir plusieurs droits : un seul par ASIN (le plus ancien identifiant)
+        no_asin = by_asin.pop("", [])
+        chosen = no_asin + [sorted(g, key=lambda x: str(x.get("id")))[0] for g in by_asin.values()]
+        games = []
+        for ent in chosen:
+            product = ent["product"]
+            det = (product.get("productDetail") or {}).get("details") or {}
+            urls = [det[k] for k in ("logoUrl", "iconUrl", "backgroundUrl1", "backgroundUrl2")
+                    if isinstance(det.get(k), str) and det[k].startswith("https://")]
+            games.append({"title": product["title"], "skey": f"prime:{ent.get('id') or product['id']}",
+                          "cover_base": urls[0] if urls else "", "cover_urls": urls, "link": ""})
+        return games
+
+
+# ---- Ubisoft Connect : session de connect.ubisoft.com (jetons du navigateur) + API de la bibliothèque,
+# comme dans Lutris. Les jetons de session sont copiés depuis le navigateur avec un petit script.
+UBI_APPID = "82b650c0-6cb3-40c0-9f41-25a53b62b206"
+UBI_GENOME = "42d07c95-9914-4450-8b38-267c4e462b21"
+UBI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/72.0.3626.121 Safari/537.36")
+UBI_SESSIONS = "https://public-ubiservices.ubi.com/v3/profiles/sessions"
+UBI_GRAPHQL = "https://public-ubiservices.ubi.com/v1/profiles/me/uplay/graphql"
+UBI_QUERY = ("query AllGames { viewer { id ...ownedGamesList } } "
+             "fragment gameProps on Game { id spaceId name coverUrl backgroundUrl bannerUrl } "
+             "fragment ownedGameProps on Game { ...gameProps viewer { meta { id "
+             "ownedPlatformGroups { id name type } } } } "
+             "fragment ownedGamesList on User { ownedGames: games(filterBy: {isOwned: true}) "
+             "{ totalCount nodes { ...ownedGameProps } } }")
+
+
+class UbisoftStore(ListMixin, Store):
+    id, name, tag, token_file = "ubisoft", "Ubisoft Connect", "UBI", "ubisoft_tokens.json"
+    kind = "paste"
+    auth_url = ("https://connect.ubisoft.com/login?appId=" + UBI_APPID + "&genomeId=" + UBI_GENOME
+                + "&lang=en-US&nextUrl=https%3A%2F%2Fconnect.ubisoft.com%2Fready")
+    snippet = ('copy(JSON.stringify([localStorage.getItem("PRODloginData"),'
+               'localStorage.getItem("PRODrememberMe"),localStorage.getItem("PRODlastProfile")]))')
+    placeholder = '["{\\"ticket\\":…}", …]'
+    steps = ["Clique sur le bouton et connecte-toi sur connect.ubisoft.com "
+             "(coche « Se souvenir de moi » pour garder la connexion plus longtemps).",
+             "Sur la page qui s'affiche ensuite, ouvre la console du navigateur (F12, onglet Console), colle le "
+             "script ci-dessous (écris « allow pasting » si on te le demande) et valide : il copie tes informations "
+             "de session. Ne les partage avec personne.",
+             "Reviens ici et clique sur « Coller et valider » (ou Ctrl+V dans le champ)."]
+    help = ("Liste de secours : un jeu par ligne (« Titre | lien | image », lien et image facultatifs). "
+            "Elle complète la connexion ou la remplace si elle est indisponible, et elle est enregistrée "
+            "dans la page HTML à la prochaine génération.")
+
+    @staticmethod
+    def parse_storage(text):
+        """Fusionne les JSON copiés depuis le navigateur : liste de 3 chaînes JSON, ou format « a,b,c »."""
+        text = text.strip()
+        try:
+            data = json.loads(text)
+            objs = data if isinstance(data, list) else [data]
+        except ValueError:
+            try:
+                objs = json.loads("[" + text + "]")
+            except ValueError:
+                raise ValueError("Données non reconnues : colle le résultat du script (il commence par « [ »).")
+        creds = {}
+        for o in objs:
+            if isinstance(o, str):
+                try:
+                    o = json.loads(o)
+                except ValueError:
+                    continue
+            if isinstance(o, dict):
+                for k in ("userId", "nameOnPlatform", "ticket", "rememberMeTicket", "sessionId"):
+                    if o.get(k):
+                        creds[k] = o[k]
+        if not all(creds.get(k) for k in ("userId", "ticket", "sessionId")):
+            raise ValueError("Informations de session incomplètes : reconnecte-toi sur connect.ubisoft.com, "
+                             "puis relance le script depuis une page de ce site.")
+        creds["username"] = creds.pop("nameOnPlatform", "")
+        return creds
+
+    def login(self, text):
+        creds = self.parse_storage(text)
+        write_private(self.tokens_path, creds)
+        try:
+            self.verify()
+        except NotLoggedIn:
+            self.logout()
+            raise ValueError("Session refusée par Ubisoft : reconnecte-toi puis recopie les informations "
+                             "sans attendre (elles expirent après quelques heures).")
+        except Exception as e:
+            self.logout()
+            raise ValueError("Vérification impossible : " + describe(e, "Ubisoft")) from e
+
+    def _creds(self):
+        if not self.tokens_path.exists():
+            raise NotLoggedIn()
+        return json.loads(self.tokens_path.read_text("utf-8"))
+
+    @staticmethod
+    def _headers(c, auth=None, session=True):
+        h = {"Ubi-AppId": UBI_APPID, "User-Agent": UBI_UA, "Accept": "*/*",
+             "Origin": "https://connect.ubisoft.com", "Referer": "https://connect.ubisoft.com/",
+             "Authorization": auth or f"Ubi_v1 t={c['ticket']}"}
+        if session and c.get("sessionId"):
+            h["Ubi-SessionId"] = c["sessionId"]
+        return h
+
+    def _renew(self, c):
+        """Renouvelle le ticket (ou, à défaut, avec le jeton « se souvenir de moi »)."""
+        def apply(j):
+            c["ticket"], c["sessionId"] = j["ticket"], j["sessionId"]
+            c["userId"] = j.get("userId", c.get("userId"))
+            if j.get("username"):
+                c["username"] = j["username"]
+            if j.get("rememberMeTicket"):
+                c["rememberMeTicket"] = j["rememberMeTicket"]
+        try:
+            j = http_json("PUT", UBI_SESSIONS, None, self._headers(c, session=False))
+        except urllib.error.HTTPError:
+            remember = c.get("rememberMeTicket")
+            if not remember:
+                raise NotLoggedIn()
+            try:
+                apply(http_json("POST", UBI_SESSIONS, {"rememberMe": True},
+                                self._headers(c, f"rm_v1 t={remember}", session=False)))
+                j = http_json("PUT", UBI_SESSIONS, None, self._headers(c, session=False))
+            except urllib.error.HTTPError as e:
+                raise NotLoggedIn() from e
+        if not isinstance(j, dict) or "ticket" not in j:
+            raise NotLoggedIn()
+        apply(j)
+        write_private(self.tokens_path, c)
+
+    def _call(self, c, method, url, obj=None):
+        """Requête authentifiée ; en cas de refus, une tentative après renouvellement de la session."""
+        def once():
+            d = http_json(method, url, obj, self._headers(c))
+            if isinstance(d, dict) and d.get("errorCode") and d.get("message"):
+                raise urllib.error.HTTPError(url, 401, str(d.get("message")), {}, None)
+            return d
+        try:
+            return once()
+        except urllib.error.HTTPError as e:
+            if e.code not in (401, 403, 412):
+                raise
+        self._renew(c)
+        try:
+            return once()
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 412):
+                raise NotLoggedIn() from e
+            raise
+
+    def verify(self):
+        c = self._creds()
+        d = self._call(c, "GET", f"https://public-ubiservices.ubi.com/v3/users/{c['userId']}")
+        return (d.get("nameOnPlatform") if isinstance(d, dict) else "") or c.get("username", "")
+
+    def api_games(self, progress):
+        c = self._creds()
+        d = self._call(c, "POST", UBI_GRAPHQL, {"operationName": "AllGames", "variables": {"owned": True},
+                                                 "query": UBI_QUERY})
+        nodes = (((d.get("data") or {}).get("viewer") or {}).get("ownedGames") or {}).get("nodes") or []
+        progress("Ubisoft Connect : lecture de la bibliothèque", len(nodes), len(nodes))
+        games, seen = [], set()
+        for n in nodes:
+            name, gid = (n.get("name") or "").strip(), n.get("spaceId") or n.get("id")
+            if not name or not gid or gid in seen:
+                continue
+            groups = ((n.get("viewer") or {}).get("meta") or {}).get("ownedPlatformGroups") or []
+            types = [p.get("type") for grp in groups for p in (grp if isinstance(grp, list) else [grp])
+                     if isinstance(p, dict)]
+            if types and "PC" not in types:  # jeu possédé seulement sur console
+                continue
+            seen.add(gid)
+            cover = next((u for u in (n.get("coverUrl"), n.get("bannerUrl"))
+                          if isinstance(u, str) and u.startswith("https://")), "")
+            games.append({"title": name, "skey": f"ubisoft:{gid}", "cover_base": cover,
+                          "cover_urls": [cover] if cover else [], "link": ""})
+        return games
 
 
 # ---- SteamGridDB (service d'images, facultatif) : jaquettes verticales « Grids »
@@ -1105,7 +1479,7 @@ def parse_previous(text):
     """Lit une page générée précédemment : jeux déjà connus (avec leur date d'ajout), jaquettes,
     caches et listes manuelles. Remplace toute base de données locale."""
     prev = {"ok": False, "legacy": False, "seen": {}, "init": set(), "covers": {}, "epic": {},
-            "lookup": {}, "manual": {}, "miss": set(), "width": 0, "titles": set(),
+            "lookup": {}, "manual": {}, "srcs": {}, "miss": set(), "width": 0, "titles": set(),
             "date": "", "count": 0}
     if not text:
         return prev
@@ -1115,7 +1489,8 @@ def parse_previous(text):
             st = json.loads(m.group(1))
             prev.update(seen=dict(st.get("seen", {})), init=set(st.get("init", [])),
                         epic=dict(st.get("epic", {})), lookup=dict(st.get("lookup", {})),
-                        manual=dict(st.get("manual", {})), miss=set(st.get("miss", [])),
+                        manual=dict(st.get("manual", {})), srcs=dict(st.get("srcs", {})),
+                        miss=set(st.get("miss", [])),
                         width=int(st.get("width", 0)), date=str(st.get("date", "")), ok=True)
         except (ValueError, TypeError, AttributeError):
             pass
@@ -1143,7 +1518,7 @@ def seed_manual(prev=None):
     for sid, txt in ((prev or {}).get("manual") or {}).items():
         MANUAL.setdefault(sid, txt)
     for s in STORES:
-        if s.kind == "manual" and s.id not in MANUAL:
+        if s.has_list and s.id not in MANUAL:
             try:
                 MANUAL[s.id] = (CONFIG / f"jeux_{s.id}.txt").read_text("utf-8")
             except OSError:
@@ -1176,7 +1551,7 @@ def merge_previous(parts):
     m.update(ok=True, legacy=not modern, width=use[0]["width"], date=use[0]["date"],
              files=[p.get("file", "") for p in use])
     for p in use:
-        for key in ("seen", "covers", "epic", "lookup", "manual"):
+        for key in ("seen", "covers", "epic", "lookup", "manual", "srcs"):
             for k, v in p[key].items():
                 m[key].setdefault(k, v)
         m["init"] |= p["init"]
@@ -1237,6 +1612,8 @@ def generate(progress=lambda *a: None, out=None, previous=None, preset="standard
             g["store"] = s.id
         games += lst
         ok_stores.append(s)
+        if getattr(s, "last_warning", ""):
+            warnings.append(s.last_warning)
     if not ok_stores:
         raise RuntimeError(" ".join(warnings))
     games.sort(key=lambda g: g["title"].lower())
@@ -1248,18 +1625,25 @@ def generate(progress=lambda *a: None, out=None, previous=None, preset="standard
     seen, added = {}, []
     for s in ok_stores:
         initialized = prev["ok"] and (prev["legacy"] or s.id in prev["init"])
+        if initialized and s.has_list and prev["srcs"].get(s.id, "list") != getattr(s, "src", "list"):
+            initialized = False  # passage de la liste à la connexion (ou inversement) : pas de faux « Nouveau »
+        old_titles = ({norm_title(k.split(":", 1)[1]) for k in prev["seen"] if k.startswith(s.id + ":")}
+                      if s.has_list else set())
         for g in (x for x in games if x["store"] == s.id):
             k = g["skey"]
             if k in prev["seen"]:
                 seen[k] = prev["seen"][k]
                 continue
-            known = prev["legacy"] and norm_title(g["title"]) in prev["titles"]
+            known = ((prev["legacy"] and norm_title(g["title"]) in prev["titles"])
+                     or norm_title(g["title"]) in old_titles)
             is_new = initialized and not known
             seen[k] = today if is_new else ""
             if is_new:
                 added.append(f"{g['title']} ({s.name})" if multi_all else g["title"])
     others = [s for s in STORES if s not in ok_stores]  # en échec ou non sélectionnées : historique conservé
     carried_init = {s.id for s in others if s.id in prev["init"]}
+    srcs = dict(prev["srcs"])
+    srcs.update({s.id: s.src for s in ok_stores if getattr(s, "src", "")})
     for k, v in prev["seen"].items():
         if any(k.startswith(s.id + ":") for s in others):
             seen[k] = v
@@ -1408,21 +1792,22 @@ def generate(progress=lambda *a: None, out=None, previous=None, preset="standard
         epic = ({k: v for k, v in CTX["epic"].items() if k in CTX["epic_seen"]}
                 if CTX["epic_seen"] else CTX["epic"]) if ("epic" in kept) else {}
         manual_titles = {norm_title(g["title"]) for g in games
-                         if g["store"] in ids and any(s.id == g["store"] and s.kind == "manual" for s in pst)}
-        state = {"v": FORMAT, "app": VERSION, "date": today, "width": width,
+                         if g["store"] in ids and any(s.id == g["store"] and s.has_list for s in pst)}
+        state = {"v": FORMAT, "app": version_label(), "date": today, "width": width,
                  "seen": {k: v for k, v in seen.items() if sid_of(k) in kept},
                  "init": sorted(({s.id for s in ok_stores} | carried_init) & kept),
+                 "srcs": {k: v for k, v in srcs.items() if k in kept},
                  "epic": epic,
                  "lookup": {k: v for k, v in CTX["lookup"].items() if k in manual_titles},
                  "miss": sorted(miss | {k for k in prev["miss"] if sid_of(k) in kept - ids}),
                  "manual": {s.id: MANUAL[s.id] for s in STORES
-                            if s.kind == "manual" and MANUAL.get(s.id, "").strip() and s.id in kept}}
+                            if s.has_list and MANUAL.get(s.id, "").strip() and s.id in kept}}
         state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
         heading = f"Ma bibliothèque {pst[0].name}" if (not is_single and len(pst) == 1) else "Ma bibliothèque de jeux"
         page = (PAGE.replace("Ma bibliothèque de jeux", html.escape(heading))
                 .replace("__N__", str(len(entries))).replace("__CHIPS__", chips)
                 .replace("__FILTER__", flt).replace("__CARDS__", "\n".join(cards))
-                .replace("__STATE__", state_json).replace("__VERSION__", VERSION))
+                .replace("__STATE__", state_json).replace("__VERSION__", version_label()))
         path = out.with_name(fname)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")  # écriture atomique : l'ancienne page reste intacte en cas d'échec
@@ -1502,7 +1887,9 @@ select{padding:8px;border-radius:8px;border:1px solid #8886;background:var(--bg)
 .finfo{word-break:break-word}
 input[type=text],input[type=password],textarea{width:100%;font-family:inherit;padding:10px 12px;border-radius:8px;border:1px solid #8886;background:var(--bg);color:var(--fg);font-size:.95rem;margin:8px 0}
 .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
-.srow{display:flex;gap:12px;align-items:center}.srow button{margin-left:auto}
+.srow{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.srow>button,.sbtns{margin-left:auto}
+.sbtns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+pre.snip{background:var(--bg);border:1px solid #8886;border-radius:8px;padding:10px;font-size:.78rem;white-space:pre-wrap;word-break:break-all;margin:8px 0;user-select:all}
 .store{padding:10px 0;border-top:1px solid #8883}.store:first-child{border-top:0;padding-top:0}
 .bar{height:10px;border-radius:99px;background:#8883;overflow:hidden;margin:12px 0 6px}
 .bar>div{height:100%;width:0;background:var(--accent);transition:width .3s}
@@ -1513,19 +1900,19 @@ ul.new{margin:6px 0;padding-left:20px;max-height:140px;overflow:auto;font-size:.
 <h1>Bibliothèque de jeux</h1><p class="sub">Une page web hors ligne avec toutes tes jaquettes (GOG, Epic, Steam…), à partager.</p>
 
 <div class="cols"><div class="col col-left">
-<div class="panel"><h2>1. Connexions</h2>
+<div class="panel"><h2>Connexions</h2>
 <h3>Boutiques avec connexion</h3><div id="stores"></div>
 <h3>Visuels des jaquettes (facultatif)</h3><div id="services"></div>
 <div class="row"><button class="sec small" id="recheck">Revérifier les connexions</button></div>
 <p class="muted">Ton mot de passe n'est jamais vu par cette application : la connexion se fait sur le site de la boutique.</p></div>
 
-<div class="panel"><h2>2. Boutiques sans connexion</h2>
+<div class="panel" id="listsPanel"><h2>Boutiques sans connexion</h2>
 <p class="muted">Ces boutiques n'offrent pas d'accès public à ton compte : renseigne simplement la liste de tes jeux.</p>
 <div id="lists"></div></div>
 
 </div>
 <div class="col col-right">
-<div class="panel"><h2>3. Ta bibliothèque</h2>
+<div class="panel"><h2>Ta bibliothèque</h2>
 <p class="muted" id="last"></p>
 <p class="muted hidden" id="hint">Connecte au moins une boutique pour commencer.</p>
 <h3>Fichiers à générer</h3>
@@ -1560,7 +1947,7 @@ ul.new{margin:6px 0;padding-left:20px;max-height:140px;overflow:auto;font-size:.
 <script>
 const T="__TOKEN__",$=id=>document.getElementById(id);
 const api=(p,b)=>fetch(p,{method:b===undefined?'GET':'POST',headers:{'X-Token':T,'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)}).then(r=>r.json());
-let presetTouched=false,timer=null,opened={},autoOpened={},stores=[],busy=false,anyLogged=false;
+let presetTouched=false,timer=null,listOpen={},opened={},autoOpened={},stores=[],busy=false,anyLogged=false;
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
 function updateGen(){$('gen').disabled=busy||!anyLogged}
 function statusOf(s){const st=(s.status||{}).state,u=(s.status||{}).user;
@@ -1568,18 +1955,24 @@ function statusOf(s){const st=(s.status||{}).state,u=(s.status||{}).user;
  if(s.logged&&st==='offline')return['warn','● non vérifié (hors ligne ?)'];
  if(s.logged)return['ok','● connecté'+(u?' ('+u+')':'')];
  if(st==='expired')return['err','● session expirée, reconnecte-toi'];
+ if(s.has_list&&s.count>0)return['ok','● liste : '+s.count+' jeu'+(s.count>1?'x':'')];
  return['muted','non connecté']}
+function copyText(t,btn){const old=btn.textContent;
+ (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>{btn.textContent='Copié ✓'}).catch(()=>{btn.textContent='Copie impossible : sélectionne le texte'});
+ setTimeout(()=>{btn.textContent=old},2500)}
 function manualBox(wrap,s){
  wrap.appendChild(el('p','muted',s.help));
  const ta=el('textarea');ta.rows=8;ta.placeholder='Un jeu par ligne';wrap.appendChild(ta);
  api('/api/manual?store='+s.id).then(r=>{ta.value=r.text});
  const ok=el('button',null,'Enregistrer');
- ok.onclick=async()=>{await api('/api/manual',{store:s.id,text:ta.value});opened[s.id]=false;await refresh()};
+ ok.onclick=async()=>{await api('/api/manual',{store:s.id,text:ta.value});opened[s.id]=false;listOpen[s.id]=false;await refresh()};
  wrap.appendChild(ok)}
 function loginBox(wrap,s){
  const ol=el('ol');s.steps.forEach(t=>ol.appendChild(el('li',null,t)));wrap.appendChild(ol);
  const a=el('a','btn sec',s.kind==='key'?'Obtenir ma clé API':'Ouvrir la connexion '+s.name);
  a.href=s.auth_url;a.target='_blank';a.rel='noopener';wrap.appendChild(a);
+ if(s.snippet){wrap.appendChild(el('pre','snip',s.snippet));
+  const cb=el('button','sec small','Copier le script');cb.onclick=()=>copyText(s.snippet,cb);wrap.appendChild(cb)}
  const err=el('p','err');
  if(s.kind==='key'){
   const inputs={};
@@ -1603,24 +1996,27 @@ function loginBox(wrap,s){
 function renderStores(){
  ['stores','services','lists'].forEach(id=>$(id).innerHTML='');
  stores.forEach(s=>{
-  const box=s.kind==='manual'?$('lists'):(s.service?$('services'):$('stores'));
-  const wrap=el('div','store'),row=el('div','srow');
+  const pure=s.kind==='manual';
+  const box=pure?$('lists'):(s.service?$('services'):$('stores'));
+  const wrap=el('div','store'),row=el('div','srow'),bx=el('div','sbtns');
   row.appendChild(el('strong',null,s.name));
-  let btn;
-  if(s.kind==='manual'){
+  if(pure){
    row.appendChild(el('span',s.count?'ok':'muted',s.count?('● '+s.count+' jeu'+(s.count>1?'x':'')):'liste vide'));
-   btn=el('button','sec small',opened[s.id]?'Fermer':'Modifier la liste');
-   btn.onclick=async()=>{opened[s.id]=!opened[s.id];await refresh()};
+   const b=el('button','sec small',opened[s.id]?'Fermer':'Modifier la liste');
+   b.onclick=async()=>{opened[s.id]=!opened[s.id];await refresh()};bx.appendChild(b);
   }else{
    const [scls,stxt]=statusOf(s);row.appendChild(el('span',scls,stxt));
-   btn=el('button','sec small',s.logged?'Se déconnecter':(opened[s.id]?'Annuler':'Se connecter'));
-   btn.onclick=async()=>{if(s.logged){await api('/api/logout',{store:s.id})}else{opened[s.id]=!opened[s.id]}await refresh()};
+   if(s.has_list){const lb=el('button','sec small',listOpen[s.id]?'Fermer la liste':'Liste manuelle');
+    lb.onclick=async()=>{listOpen[s.id]=!listOpen[s.id];await refresh()};bx.appendChild(lb)}
+   const b=el('button','sec small',s.logged?'Se déconnecter':(opened[s.id]?'Annuler':'Se connecter'));
+   b.onclick=async()=>{if(s.logged){await api('/api/logout',{store:s.id})}else{opened[s.id]=!opened[s.id]}await refresh()};bx.appendChild(b);
   }
-  row.appendChild(btn);wrap.appendChild(row);
-  if(s.kind!=='manual'&&(s.status||{}).state==='offline'&&s.status.detail)wrap.appendChild(el('p','muted',s.status.detail));
-  if(s.kind==='manual'){if(opened[s.id])manualBox(wrap,s)}
-  else if(!s.logged&&opened[s.id])loginBox(wrap,s);
-  box.appendChild(wrap)})}
+  row.appendChild(bx);wrap.appendChild(row);
+  if(!pure&&(s.status||{}).state==='offline'&&s.status.detail)wrap.appendChild(el('p','muted',s.status.detail));
+  if(pure){if(opened[s.id])manualBox(wrap,s)}
+  else{if(!s.logged&&opened[s.id])loginBox(wrap,s);if(s.has_list&&listOpen[s.id])manualBox(wrap,s)}
+  box.appendChild(wrap)});
+ $('listsPanel').classList.toggle('hidden',!stores.some(x=>x.kind==='manual'))}
 function showTool(i){const e=$('imgtool');
  if(i&&i.tool){e.textContent='Conversion des images : '+i.tool+' → '+i.format+'.';e.className='muted'}
  else{e.textContent="⚠ Aucun outil de conversion d'images trouvé (Pillow, ImageMagick ou ffmpeg) : les images ne seront ni réduites ni converties en WebP. Installe Pillow, par exemple : nix-shell -p 'python3.withPackages (p: [ p.pillow ])'";e.className='warn'}}
@@ -1633,7 +2029,7 @@ async function refresh(){const s=await api('/api/state');stores=s.stores;
  stores.forEach(x=>{if((x.status||{}).state==='expired'&&!autoOpened[x.id]){autoOpened[x.id]=true;opened[x.id]=true}});
  renderStores();
  if(stores.some(x=>x.logged&&(x.status||{}).state==='checking'))setTimeout(refresh,900);
- anyLogged=stores.some(x=>x.logged&&!x.service);updateGen();$('hint').classList.toggle('hidden',anyLogged);
+ anyLogged=stores.some(x=>(x.usable===undefined?x.logged:x.usable)&&!x.service);updateGen();$('hint').classList.toggle('hidden',anyLogged);
  $('last').textContent=s.last?('Dernière génération : '+s.last):'Aucune page générée pour le moment.';showPrev(s.previous);showTool(s.images)}
 function render(st){
  busy=st.state==='running';updateGen();
@@ -1691,14 +2087,14 @@ class App:
 
     def status_of(self, store):
         c = self.checks.get(store.id, {"state": "unknown"})
-        if not store.logged_in() and c["state"] != "expired":
+        if not store.connected() and c["state"] != "expired":
             return {"state": "none"}
         return c
 
     def start_check(self):
         """Vérifie en arrière-plan la connexion de chaque boutique et service."""
         for s in STORES + SERVICES:
-            if s.logged_in():
+            if s.connected():
                 self.checks[s.id] = {"state": "checking"}
                 threading.Thread(target=lambda st=s: self.checks.__setitem__(st.id, st.check()),
                                  daemon=True).start()
@@ -1812,7 +2208,7 @@ def make_handler(app):
             elif path == "/api/manual":
                 try:
                     store = get_store(parse_qs(urlparse(self.path).query).get("store", [""])[0])
-                    self.send_json({"text": store.read_text() if store.kind == "manual" else ""})
+                    self.send_json({"text": store.read_text() if store.has_list else ""})
                 except StopIteration:
                     self.send_json({"text": ""})
             elif path == "/download":
@@ -1874,7 +2270,7 @@ def make_handler(app):
             elif path == "/api/manual":
                 try:
                     store = get_store(body.get("store"))
-                    if store.kind != "manual":
+                    if not store.has_list:
                         raise StopIteration
                     store.write_text(str(body.get("text", ""))[:200000])
                     self.send_json({"ok": True, "count": store.count()})
@@ -1958,7 +2354,7 @@ def run_auto(previous_path=None, preset="standard", refresh=False, single=True, 
 def clean_legacy():
     """Supprime les fichiers de l'ancienne version (base de données locale)."""
     names = ["cache", "state.json", "epic_catalog.json", "cover_lookup.json"] + [
-        f"jeux_{s.id}.txt" for s in STORES if s.kind == "manual"]
+        f"jeux_{s.id}.txt" for s in STORES if s.has_list]
     found = [CONFIG / n for n in names if (CONFIG / n).exists()]
     if not found:
         print("Rien à nettoyer.")
