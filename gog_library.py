@@ -66,7 +66,8 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 #     v0.25  (ex-2.5.0) deux cases : fichier unique / par plateforme, version affichée   <- RÉFÉRENCE
 #     v0.26  nouveau format de numérotation, documentation de l'en-tête, import inutilisé retiré
 #     v0.27  Ubisoft Connect et Prime Gaming par connexion (méthode de Lutris), liste manuelle en secours
-VERSION = "0.27"
+#     v0.28  itch.io (clé API), images en paysage gardées entières sur fond flou
+VERSION = "0.28"
 FORMAT = 3  # version du format des données intégrées dans les pages (indépendante du numéro de version)
 
 
@@ -271,7 +272,7 @@ def mime_of(data):
 
 
 def _pillow_encode(data, width, quality):
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageFilter, ImageOps
     im = Image.open(io.BytesIO(data))
     im.load()
     if "A" in im.getbands():  # transparence : fond sombre
@@ -280,8 +281,16 @@ def _pillow_encode(data, width, quality):
         im.paste(rgba, mask=rgba.getchannel("A"))
     else:
         im = im.convert("RGB")
-    tw = max(16, min(width, im.width, int(im.height / 1.5)))
-    im = ImageOps.fit(im, (tw, int(tw * 1.5)), method=Image.LANCZOS, centering=(0.5, 0.35))
+    if im.width >= im.height:  # paysage ou carré : l'image entière sur un fond flou, sans recadrage
+        tw, th = width, int(width * 1.5)
+        back = ImageOps.fit(im, (tw, th), method=Image.BILINEAR).filter(ImageFilter.GaussianBlur(10))
+        im_fg = ImageOps.contain(im, (tw, th), method=Image.LANCZOS)
+        back = Image.blend(back, Image.new("RGB", (tw, th), (24, 24, 32)), 0.45)
+        back.paste(im_fg, ((tw - im_fg.width) // 2, (th - im_fg.height) // 2))
+        im = back
+    else:
+        tw = max(16, min(width, im.width, int(im.height / 1.5)))
+        im = ImageOps.fit(im, (tw, int(tw * 1.5)), method=Image.LANCZOS, centering=(0.5, 0.35))
     buf = io.BytesIO()
     try:
         im.save(buf, "WEBP", quality=quality, method=6)
@@ -810,6 +819,84 @@ class SteamStore(Store):
         return games
 
 
+# ---- itch.io : clé API personnelle (la même méthode que Lutris)
+ITCH_API = "https://api.itch.io"
+
+
+class ItchStore(Store):
+    id, name, tag, token_file = "itchio", "itch.io", "ITCH", "itchio_tokens.json"
+    kind = "key"
+    auth_url = "https://itch.io/user/settings/api-keys"
+    fields = [{"name": "key", "label": "Clé API itch.io", "secret": True}]
+    steps = ["Ouvre la page des clés API avec le bouton ci-dessous (connecte-toi à itch.io si besoin).",
+             "Clique sur « Generate new API key » : donne-lui son propre nom, par exemple « bibliothèque ».",
+             "Copie la clé et colle-la ci-dessous. Elle reste sur ton ordinateur et tu peux la révoquer "
+             "à tout moment depuis cette même page."]
+
+    def _call(self, path, **params):
+        try:
+            return http_json("GET", ITCH_API + path + ("?" + urlencode(params) if params else ""), None,
+                             {"Authorization": "Bearer " + self._key()})
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise NotLoggedIn() from e
+            raise
+
+    def _key(self):
+        if not self.tokens_path.exists():
+            raise NotLoggedIn()
+        return json.loads(self.tokens_path.read_text("utf-8"))["api_key"]
+
+    def login_fields(self, v):
+        key = (v.get("key") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", key):
+            raise ValueError("Clé API non reconnue (20 à 100 caractères, lettres et chiffres).")
+        write_private(self.tokens_path, {"api_key": key})
+        try:
+            self.verify()
+        except NotLoggedIn:
+            self.logout()
+            raise ValueError("Clé API refusée par itch.io : vérifie qu'elle est complète et non révoquée.")
+        except Exception as e:
+            self.logout()
+            raise ValueError("Vérification impossible : " + describe(e, "itch.io")) from e
+
+    def verify(self):
+        user = (self._call("/profile") or {}).get("user")
+        if not user:
+            raise NotLoggedIn()
+        return user.get("display_name") or user.get("username") or ""
+
+    def fetch(self, progress):
+        keys, page = [], 1
+        while page <= 300:  # garde-fou
+            d = self._call("/profile/owned-keys", page=page)
+            batch = d.get("owned_keys") if isinstance(d, dict) else None
+            if not isinstance(batch, list) or not batch:
+                break
+            keys += batch
+            progress("itch.io : lecture de la bibliothèque", len(keys), 0)
+            per_page = int(d.get("per_page") or 0)
+            if len(batch) < per_page or not per_page:
+                break
+            page += 1
+        games, seen = [], set()
+        for k in keys:
+            game = k.get("game") or {}
+            gid, title = game.get("id"), (game.get("title") or "").strip()
+            if not gid or not title or gid in seen:
+                continue
+            if game.get("classification") not in (None, "", "game"):  # bandes-son, outils, ressources…
+                continue
+            seen.add(gid)
+            cover = next((u for u in (game.get("still_cover_url"), game.get("cover_url"))
+                          if isinstance(u, str) and u.startswith("https://")), "")
+            url = game.get("url") if isinstance(game.get("url"), str) and game["url"].startswith("https://") else ""
+            games.append({"title": title, "skey": f"itchio:{gid}", "cover_base": cover,
+                          "cover_urls": [cover] if cover else [], "link": url})
+        return games
+
+
 # ---- Plateformes à liste manuelle et/ou connexion (Ubisoft Connect, Prime Gaming)
 class ListMixin:
     """Liste de jeux saisie à la main (« Titre | lien | image »), conservée dans la page HTML.
@@ -1331,7 +1418,7 @@ class GridService(Store):
         return top.get("thumb") or top.get("url")
 
 
-STORES = [GOGStore(), EpicStore(), SteamStore(), UbisoftStore(), PrimeStore()]
+STORES = [GOGStore(), EpicStore(), SteamStore(), UbisoftStore(), PrimeStore(), ItchStore()]
 SGDB = GridService()
 SERVICES = [SGDB]
 
@@ -1436,7 +1523,7 @@ figcaption{padding:8px 10px;font-size:.82rem;line-height:1.25}
 .badge{position:absolute;top:8px;left:8px;z-index:1;background:var(--accent);color:#111;font-size:.7rem;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase}
 .tags{position:absolute;top:8px;right:8px;z-index:1;display:flex;flex-direction:column;gap:3px;align-items:flex-end}
 .tag{background:#000a;color:#fff;font-size:.62rem;font-weight:700;padding:2px 7px;border-radius:999px;letter-spacing:.04em}
-.tag.gog{background:#6b3fd4e6}.tag.epic{background:#2a2a2ae6}.tag.steam{background:#1b6fa8e6}.tag.ubisoft{background:#0b63cee6}.tag.prime{background:#007da8e6}
+.tag.gog{background:#6b3fd4e6}.tag.epic{background:#2a2a2ae6}.tag.steam{background:#1b6fa8e6}.tag.ubisoft{background:#0b63cee6}.tag.prime{background:#007da8e6}.tag.itchio{background:#e0463ee6}
 .dlg{position:fixed;inset:0;z-index:20;background:#000a;display:flex;align-items:center;justify-content:center;padding:20px}
 .dlg .box{background:var(--card);border-radius:12px;padding:20px;max-width:360px;width:100%;text-align:center}
 .dlg h3{margin:0 0 14px;font-size:1rem}
@@ -2403,7 +2490,12 @@ def run_diagnostic():
                ("Epic (catalogue)", "https://catalog-public-service-prod06.ol.epicgames.com/"),
                ("Steam (API)", "https://api.steampowered.com/"),
                ("Steam (images)", "https://cdn.cloudflare.steamstatic.com/"),
-               ("SteamGridDB", "https://www.steamgriddb.com/api/v2/")]
+               ("SteamGridDB", "https://www.steamgriddb.com/api/v2/"),
+               ("Ubisoft (connexion)", "https://connect.ubisoft.com/"),
+               ("Ubisoft (API)", "https://public-ubiservices.ubi.com/"),
+               ("Amazon (connexion)", "https://api.amazon.com/"),
+               ("Amazon (bibliothèque)", "https://gaming.amazon.com/"),
+               ("itch.io", "https://api.itch.io/")]
     for name, url in targets:
         try:
             http_get(url, timeout=15)
