@@ -45,7 +45,7 @@ except ImportError:  # Python compilé sans OpenSSL (ex. python3Minimal) : modul
 import webbrowser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
@@ -67,7 +67,13 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 #     v0.26  nouveau format de numérotation, documentation de l'en-tête, import inutilisé retiré
 #     v0.27  Ubisoft Connect et Prime Gaming par connexion (méthode de Lutris), liste manuelle en secours
 #     v0.28  itch.io (clé API), images en paysage gardées entières sur fond flou
-VERSION = "0.28"
+#     v0.29  Ubisoft : confirmation de session comme Lutris, erreurs détaillées, renouvellement anticipé
+#     v0.30  Ubisoft : instructions précisées (la page 404 après la connexion est normale)
+#     v0.31  Ubisoft : script de console tolérant (stockage refusé par le navigateur), erreurs signalées
+#     v0.32  Ubisoft : la session est lue sur la page change_domain (comme Lutris), bouton dédié
+#     v0.33  Ubisoft : méthode alternative sans stockage du navigateur (réponse de connexion, onglet Réseau)
+#     v0.34  Ubisoft : textes simplifiés ; jeux sans page de boutique : redirection vers Steam après 5 s
+VERSION = "0.34"
 FORMAT = 3  # version du format des données intégrées dans les pages (indépendante du numéro de version)
 
 
@@ -153,12 +159,18 @@ def net_error(e, site):
     return f"impossible de joindre {site} : {reason}"
 
 
+def redact(text):
+    """Masque les clés, jetons et codes qui pourraient apparaître dans un message d'erreur."""
+    text = re.sub(r"(?i)\b(Ubi_v1|rm_v1)\s+t=[^\s)&\"']+", r"\1 t=***", str(text))
+    return re.sub(r"(?i)\b(key|api_key|token|access_token|ticket|code)=[^&\s)\"']+", r"\1=***", text)
+
+
 def describe(e, site):
     if isinstance(e, urllib.error.HTTPError):
         return f"{site} a répondu avec l'erreur HTTP {e.code}"
     if isinstance(e, urllib.error.URLError):
-        return net_error(e, site)
-    return str(e)
+        return redact(net_error(e, site))
+    return redact(e)
 
 
 def http_detail(e):
@@ -418,6 +430,9 @@ class Store:
     service = False         # True : service annexe (images), pas une boutique
     has_list = False        # True : la plateforme accepte aussi une liste manuelle
     snippet = ""            # script à coller dans la console du navigateur (connexion par copie)
+    last_error = ""         # détail de la dernière erreur de connexion (affiché à l'utilisateur)
+    extra_links = []        # boutons supplémentaires dans le panneau de connexion [{"label", "url"}]
+    alt_title, alt_steps = "", []  # méthode alternative de connexion (étapes repliables)
 
     def count(self):
         return 0
@@ -450,7 +465,7 @@ class Store:
             return {"state": "ok", "user": self.verify()}
         except NotLoggedIn:
             self.logout()
-            return {"state": "expired"}
+            return {"state": "expired", "detail": self.last_error}
         except Exception as e:
             return {"state": "offline", "detail": describe(e, self.name)[:300]}
 
@@ -473,7 +488,9 @@ class Store:
                 "usable": self.logged_in(), "auth_url": self.auth_url, "steps": self.steps,
                 "placeholder": self.placeholder, "kind": self.kind,
                 "fields": self.fields, "help": self.help, "count": self.count(),
-                "service": self.service, "has_list": self.has_list, "snippet": self.snippet}
+                "service": self.service, "has_list": self.has_list, "snippet": self.snippet,
+                "extra_links": self.extra_links, "alt_title": self.alt_title,
+                "alt_steps": self.alt_steps}
 
 
 # ---- GOG (client public GOG Galaxy, comme Heroic / Minigalaxy)
@@ -728,6 +745,18 @@ class EpicStore(Store):
 STEAM_API = "https://api.steampowered.com"
 
 
+def steam_lookup(title):
+    """Identifiant Steam d'un jeu (titre identique exigé) : appid, 0 si absent de Steam,
+    None si la recherche a échoué (rien n'est alors mémorisé)."""
+    key = norm_title(title)
+    try:
+        d = json.loads(http_get("https://store.steampowered.com/api/storesearch/?" +
+                                urlencode({"term": title, "l": "english", "cc": "US"})))
+        return next((x["id"] for x in d.get("items", []) if norm_title(x.get("name", "")) == key), 0)
+    except Exception:
+        return None
+
+
 def steam_cover_urls(appid):
     base = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/"
     return base + "library_600x900.jpg", [base + "library_600x900.jpg", base + "header.jpg"]
@@ -945,14 +974,7 @@ class ListMixin:
 
         def lookup(i):
             nonlocal done
-            key, appid = norm_title(i["title"]), None
-            try:  # jaquette retrouvée via la recherche du magasin Steam (titre identique exigé)
-                d = json.loads(http_get("https://store.steampowered.com/api/storesearch/?" +
-                                        urlencode({"term": i["title"], "l": "english", "cc": "US"})))
-                appid = next((x["id"] for x in d.get("items", [])
-                              if norm_title(x.get("name", "")) == key), 0)
-            except Exception:
-                pass
+            key, appid = norm_title(i["title"]), steam_lookup(i["title"])  # jaquette via la recherche Steam
             with lock:
                 done += 1
                 progress(f"{self.name} : recherche des jaquettes", done, len(todo))
@@ -988,7 +1010,8 @@ class ListMixin:
                 if not self.count():
                     raise
                 self.logout()
-                self.last_warning = f"{self.name} : session expirée, liste manuelle utilisée (reconnecte-toi)."
+                detail = f" ({self.last_error})" if self.last_error else ""
+                self.last_warning = f"{self.name} : session expirée, liste manuelle utilisée (reconnecte-toi){detail}."
         have = {norm_title(g["title"]) for g in api}
         extra = [g for g in (self.list_games(progress) if self.count() else [])
                  if norm_title(g["title"]) not in have]
@@ -1182,6 +1205,7 @@ UBI_GENOME = "42d07c95-9914-4450-8b38-267c4e462b21"
 UBI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
           "Chrome/72.0.3626.121 Safari/537.36")
 UBI_SESSIONS = "https://public-ubiservices.ubi.com/v3/profiles/sessions"
+UBI_SESSIONS_V2 = "https://public-ubiservices.ubi.com/v2/profiles/sessions"
 UBI_GRAPHQL = "https://public-ubiservices.ubi.com/v1/profiles/me/uplay/graphql"
 UBI_QUERY = ("query AllGames { viewer { id ...ownedGamesList } } "
              "fragment gameProps on Game { id spaceId name coverUrl backgroundUrl bannerUrl } "
@@ -1191,20 +1215,46 @@ UBI_QUERY = ("query AllGames { viewer { id ...ownedGamesList } } "
              "{ totalCount nodes { ...ownedGameProps } } }")
 
 
+def parse_iso(text):
+    """Date d'Ubisoft (ex. 2026-11-02T10:00:00.1234567Z) -> datetime ; None si illisible."""
+    m = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.(\d+))?", str(text or ""))
+    if not m:
+        return None
+    frac = (m.group(3) or "0")[:6].ljust(6, "0")
+    return datetime.strptime(f"{m.group(1)}T{m.group(2)}.{frac}", "%Y-%m-%dT%H:%M:%S.%f")
+
+
 class UbisoftStore(ListMixin, Store):
     id, name, tag, token_file = "ubisoft", "Ubisoft Connect", "UBI", "ubisoft_tokens.json"
     kind = "paste"
     auth_url = ("https://connect.ubisoft.com/login?appId=" + UBI_APPID + "&genomeId=" + UBI_GENOME
                 + "&lang=en-US&nextUrl=https%3A%2F%2Fconnect.ubisoft.com%2Fready")
-    snippet = ('copy(JSON.stringify([localStorage.getItem("PRODloginData"),'
-               'localStorage.getItem("PRODrememberMe"),localStorage.getItem("PRODlastProfile")]))')
+    snippet = ('(()=>{const e=[],r=["PRODloginData","PRODrememberMe","PRODlastProfile"].map(k=>{'
+               'for(const s of ["localStorage","sessionStorage"]){try{const v=window[s].getItem(k);if(v)return v}'
+               'catch(x){e.push(s+": "+(x.name||x))}}return null});'
+               'copy(JSON.stringify(e.length?[...r,{_errors:[...new Set(e)]}]:r))})()')
     placeholder = '["{\\"ticket\\":…}", …]'
-    steps = ["Clique sur le bouton et connecte-toi sur connect.ubisoft.com "
-             "(coche « Se souvenir de moi » pour garder la connexion plus longtemps).",
-             "Sur la page qui s'affiche ensuite, ouvre la console du navigateur (F12, onglet Console), colle le "
-             "script ci-dessous (écris « allow pasting » si on te le demande) et valide : il copie tes informations "
-             "de session. Ne les partage avec personne.",
-             "Reviens ici et clique sur « Coller et valider » (ou Ctrl+V dans le champ)."]
+    extra_links = [{"label": "Ouvrir la page de lecture de la session",
+                    "url": "https://connect.ubisoft.com/change_domain/"}]
+    steps = ["Clique sur « Ouvrir la connexion » et connecte-toi (coche « Se souvenir de moi »). "
+             "Une page 404 s'affiche ensuite : c'est normal.",
+             "Clique sur « Ouvrir la page de lecture de la session ».",
+             "Sur cette page, appuie sur F12, ouvre l'onglet « Console », colle le script ci-dessous et valide "
+             "(si le navigateur le demande, écris d'abord « allow pasting »).",
+             "Reviens ici et clique sur « Coller et valider ». Ce que tu copies contient ta session : ne le "
+             "partage avec personne."]
+    alt_title = "Ça ne marche pas ? Autre méthode (onglet Réseau)"
+    alt_steps = ["Ouvre les outils du navigateur (touche F12) puis l'onglet « Réseau » et active « Conserver les "
+                 "journaux » (Firefox : roue dentée ; Chrome : « Preserve log »). Fais-le avant de te connecter.",
+                 "Clique sur « Ouvrir la connexion » et connecte-toi (coche « Se souvenir de moi »).",
+                 "Dans le Réseau, tape « sessions » dans le filtre. Choisis la dernière ligne dont le domaine est "
+                 "« https://public-ubiservices.ubi.com » et le fichier est « sessions » (adresse complète : "
+                 "https://public-ubiservices.ubi.com/v3/profiles/sessions). Si tu as un code de double "
+                 "authentification, prends la dernière ligne.",
+                 "Clique sur cette ligne, ouvre l'onglet « Réponse », fais un clic droit puis « Tout copier » "
+                 "(pas « Copier la valeur »).",
+                 "Reviens ici, colle dans le champ et clique sur « Coller et valider ». Ce que tu copies contient "
+                 "ta session : ne le partage avec personne."]
     help = ("Liste de secours : un jeu par ligne (« Titre | lien | image », lien et image facultatifs). "
             "Elle complète la connexion ou la remplace si elle est indisponible, et elle est enregistrée "
             "dans la page HTML à la prochaine génération.")
@@ -1220,7 +1270,17 @@ class UbisoftStore(ListMixin, Store):
             try:
                 objs = json.loads("[" + text + "]")
             except ValueError:
-                raise ValueError("Données non reconnues : colle le résultat du script (il commence par « [ »).")
+                raise ValueError("Texte non reconnu : colle ce que tu as copié depuis le navigateur.")
+        errs = [str(e) for o in objs if isinstance(o, dict) for e in (o.get("_errors") or [])]
+        objs = [o for o in objs if not (isinstance(o, dict) and "_errors" in o)]
+        hint = (" Ton navigateur bloque l'accès au stockage (" + ", ".join(errs) + ") : utilise plutôt l'autre "
+                "méthode (onglet Réseau), décrite sous les étapes.") if errs else ""
+        if objs and all(o in (None, "", "null") for o in objs):
+            raise ValueError("Le script n'a rien trouvé. Lance-le sur https://connect.ubisoft.com/change_domain/ "
+                             "juste après ta connexion, ou utilise l'autre méthode (onglet Réseau)." + hint)
+        if any(isinstance(o, dict) and o.get("twoFactorAuthenticationTicket") and not o.get("ticket") for o in objs):
+            raise ValueError("C'est l'étape du code de double authentification : choisis la ligne suivante, "
+                             "celle dont la réponse contient « ticket ».")
         creds = {}
         for o in objs:
             if isinstance(o, str):
@@ -1233,23 +1293,10 @@ class UbisoftStore(ListMixin, Store):
                     if o.get(k):
                         creds[k] = o[k]
         if not all(creds.get(k) for k in ("userId", "ticket", "sessionId")):
-            raise ValueError("Informations de session incomplètes : reconnecte-toi sur connect.ubisoft.com, "
-                             "puis relance le script depuis une page de ce site.")
+            raise ValueError("Informations incomplètes : reconnecte-toi, puis recopie-les depuis la bonne page "
+                             "ou avec l'autre méthode (onglet Réseau)." + hint)
         creds["username"] = creds.pop("nameOnPlatform", "")
         return creds
-
-    def login(self, text):
-        creds = self.parse_storage(text)
-        write_private(self.tokens_path, creds)
-        try:
-            self.verify()
-        except NotLoggedIn:
-            self.logout()
-            raise ValueError("Session refusée par Ubisoft : reconnecte-toi puis recopie les informations "
-                             "sans attendre (elles expirent après quelques heures).")
-        except Exception as e:
-            self.logout()
-            raise ValueError("Vérification impossible : " + describe(e, "Ubisoft")) from e
 
     def _creds(self):
         if not self.tokens_path.exists():
@@ -1257,13 +1304,39 @@ class UbisoftStore(ListMixin, Store):
         return json.loads(self.tokens_path.read_text("utf-8"))
 
     @staticmethod
-    def _headers(c, auth=None, session=True):
+    def _headers(c, auth=None, refresh=False):
+        """En-têtes comme dans Lutris : appels normaux = session ; renouvellements = navigateur de connect."""
         h = {"Ubi-AppId": UBI_APPID, "User-Agent": UBI_UA, "Accept": "*/*",
-             "Origin": "https://connect.ubisoft.com", "Referer": "https://connect.ubisoft.com/",
              "Authorization": auth or f"Ubi_v1 t={c['ticket']}"}
-        if session and c.get("sessionId"):
+        if refresh:
+            h.update({"Origin": "https://connect.ubisoft.com", "Referer": "https://connect.ubisoft.com",
+                      "Content-Type": "application/json", "Accept-Language": "en-US;en;q=0.5"})
+        elif c.get("sessionId"):
             h["Ubi-SessionId"] = c["sessionId"]
         return h
+
+    @staticmethod
+    def _describe(e):
+        """Texte lisible d'une erreur d'Ubisoft : code HTTP + message du serveur."""
+        detail = ""
+        try:
+            d = json.loads(e.read() or b"{}")
+            if d.get("message"):
+                detail = f"{d['message']} (errorCode {d.get('errorCode', '?')})"
+        except Exception:
+            detail = str(getattr(e, "msg", "") or "")
+        return f"HTTP {e.code}" + (f" : {detail}" if detail and detail != "None" else "")
+
+    def _note(self, text):
+        self.last_error = (self.last_error + " ; " if self.last_error else "") + text
+
+    @staticmethod
+    def _stamp(c, j):
+        """Heure à laquelle la session doit être renouvelée (d'après « expiration » et « serverTime »)."""
+        if isinstance(j, dict):
+            exp, srv = parse_iso(j.get("expiration")), parse_iso(j.get("serverTime"))
+            if exp and srv:
+                c["refreshTime"] = time.time() + (exp - srv).total_seconds()
 
     def _renew(self, c):
         """Renouvelle le ticket (ou, à défaut, avec le jeton « se souvenir de moi »)."""
@@ -1274,47 +1347,79 @@ class UbisoftStore(ListMixin, Store):
                 c["username"] = j["username"]
             if j.get("rememberMeTicket"):
                 c["rememberMeTicket"] = j["rememberMeTicket"]
+            self._stamp(c, j)
         try:
-            j = http_json("PUT", UBI_SESSIONS, None, self._headers(c, session=False))
-        except urllib.error.HTTPError:
+            j = http_json("PUT", UBI_SESSIONS, None, self._headers(c, refresh=True))
+        except urllib.error.HTTPError as e1:
+            self._note("renouvellement du ticket refusé (" + self._describe(e1) + ")")
             remember = c.get("rememberMeTicket")
             if not remember:
+                self._note("pas de jeton « se souvenir de moi »")
                 raise NotLoggedIn()
             try:
                 apply(http_json("POST", UBI_SESSIONS, {"rememberMe": True},
-                                self._headers(c, f"rm_v1 t={remember}", session=False)))
-                j = http_json("PUT", UBI_SESSIONS, None, self._headers(c, session=False))
-            except urllib.error.HTTPError as e:
-                raise NotLoggedIn() from e
+                                self._headers(c, f"rm_v1 t={remember}", refresh=True)))
+                j = http_json("PUT", UBI_SESSIONS, None, self._headers(c, refresh=True))
+            except urllib.error.HTTPError as e2:
+                self._note("jeton « se souvenir de moi » refusé (" + self._describe(e2) + ")")
+                raise NotLoggedIn() from e2
         if not isinstance(j, dict) or "ticket" not in j:
+            self._note("réponse de renouvellement inattendue")
             raise NotLoggedIn()
         apply(j)
         write_private(self.tokens_path, c)
 
-    def _call(self, c, method, url, obj=None):
-        """Requête authentifiée ; en cas de refus, une tentative après renouvellement de la session."""
+    def _call(self, c, method, url, obj=None, json_header=False):
+        """Requête authentifiée : renouvellement avant l'expiration, puis une tentative après un refus."""
+        self.last_error = ""
+        if c.get("refreshTime") and time.time() > float(c["refreshTime"]) - 120:
+            self._renew(c)
+
         def once():
-            d = http_json(method, url, obj, self._headers(c))
+            h = self._headers(c)
+            if json_header:
+                h["Content-Type"] = "application/json"
+            d = http_json(method, url, obj, h)
             if isinstance(d, dict) and d.get("errorCode") and d.get("message"):
-                raise urllib.error.HTTPError(url, 401, str(d.get("message")), {}, None)
+                raise urllib.error.HTTPError(url, int(d.get("httpCode") or 401), str(d["message"]), {}, None)
             return d
         try:
             return once()
         except urllib.error.HTTPError as e:
             if e.code not in (401, 403, 412):
                 raise
+            self._note("requête refusée (" + self._describe(e) + ")")
         self._renew(c)
         try:
             return once()
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 412):
+                self._note("encore refusée après renouvellement (" + self._describe(e) + ")")
                 raise NotLoggedIn() from e
             raise
 
+    def login(self, text):
+        creds = self.parse_storage(text)
+        write_private(self.tokens_path, creds)
+        try:
+            self.verify()
+        except NotLoggedIn:
+            err = self.last_error
+            self.logout()
+            raise ValueError("Ubisoft a refusé la session" + (f" ({err})" if err else "")
+                             + ". Reconnecte-toi, puis recopie vite les informations : elles expirent en "
+                             "quelques heures.")
+        except Exception as e:
+            self.logout()
+            raise ValueError("Vérification impossible : " + describe(e, "Ubisoft")) from e
+
     def verify(self):
         c = self._creds()
-        d = self._call(c, "GET", f"https://public-ubiservices.ubi.com/v3/users/{c['userId']}")
-        return (d.get("nameOnPlatform") if isinstance(d, dict) else "") or c.get("username", "")
+        d = self._call(c, "POST", UBI_SESSIONS_V2, None, json_header=True)  # confirmation de la session, comme Lutris
+        self._stamp(c, d)
+        write_private(self.tokens_path, c)
+        name = (d.get("nameOnPlatform") if isinstance(d, dict) else "") or c.get("username", "")
+        return name + ("" if c.get("rememberMeTicket") else " — session courte, sans « se souvenir de moi »")
 
     def api_games(self, progress):
         c = self._creds()
@@ -1528,6 +1633,7 @@ figcaption{padding:8px 10px;font-size:.82rem;line-height:1.25}
 .dlg .box{background:var(--card);border-radius:12px;padding:20px;max-width:360px;width:100%;text-align:center}
 .dlg h3{margin:0 0 14px;font-size:1rem}
 .opt{display:block;background:var(--accent);color:#111;font-weight:600;text-decoration:none;border-radius:8px;padding:10px;margin-bottom:10px}
+.dlg p{margin:8px 0;line-height:1.4}
 .hidden{display:none!important}
 </style></head><body>
 <header><h1>Ma bibliothèque de jeux</h1><span id="count">__N__ jeux</span>
@@ -1535,6 +1641,11 @@ figcaption{padding:8px 10px;font-size:.82rem;line-height:1.25}
 <main>__CARDS__</main>
 <div id="dlg" class="dlg hidden"><div class="box"><h3 id="dt"></h3><div id="dll"></div>
 <button id="dx" class="chip">Annuler</button></div></div>
+<div id="dlg2" class="dlg hidden"><div class="box"><h3 id="d2t"></h3>
+<p>Boutique d'origine : <b id="d2o"></b></p><p id="d2m"></p>
+<p>Redirection dans <b id="d2c">5</b> s…</p>
+<a id="d2go" class="opt" href="#" rel="noopener noreferrer">Aller sur Steam maintenant</a>
+<button id="d2x" class="chip">Annuler</button></div></div>
 <script type="application/json" id="gl-data">__STATE__</script>
 <script>
 const cards=[...document.querySelectorAll('.card')],count=document.getElementById('count'),
@@ -1558,7 +1669,19 @@ const b=document.createElement('a');b.className='opt';b.href=l.u;b.target='_blan
 b.textContent='Ouvrir sur '+l.n;b.addEventListener('click',()=>dlg.classList.add('hidden'));dll.appendChild(b)});
 dlg.classList.remove('hidden')}));
 dlg.addEventListener('click',e=>{if(e.target===dlg||e.target.id==='dx')dlg.classList.add('hidden')});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')dlg.classList.add('hidden')});
+const d2=document.getElementById('dlg2');let t2=null;
+function closeD2(){clearInterval(t2);t2=null;d2.classList.add('hidden')}
+document.querySelectorAll('a.steamfb').forEach(a=>a.addEventListener('click',ev=>{
+ev.preventDefault();const url=a.href;if(!/^https:\\/\\/store\\.steampowered\\.com\\//.test(url))return;
+document.getElementById('d2t').textContent=a.dataset.title;
+document.getElementById('d2o').textContent=a.dataset.origin;
+document.getElementById('d2m').textContent="Cette boutique ne propose pas de page pour ce jeu. Vous allez être redirigé vers "+(a.dataset.exact==='1'?"sa page":"la recherche")+" Steam.";
+let n=5;const c=document.getElementById('d2c');c.textContent=n;document.getElementById('d2go').href=url;
+d2.classList.remove('hidden');clearInterval(t2);
+t2=setInterval(()=>{n--;c.textContent=n;if(n<=0){clearInterval(t2);location.href=url}},1000)}));
+document.getElementById('d2x').addEventListener('click',closeD2);
+d2.addEventListener('click',e=>{if(e.target===d2)closeD2()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){dlg.classList.add('hidden');closeD2()}});
 </script></body></html>"""
 
 
@@ -1690,7 +1813,8 @@ def generate(progress=lambda *a: None, out=None, previous=None, preset="standard
             lst = s.fetch(progress)
         except NotLoggedIn:
             s.logout()
-            warnings.append(f"{s.name} : session expirée, reconnecte-toi (ignoré cette fois).")
+            detail = f" ({s.last_error})" if s.last_error else ""
+            warnings.append(f"{s.name} : session expirée, reconnecte-toi{detail} (ignoré cette fois).")
             continue
         except Exception as e:
             warnings.append(f"{s.name} : {describe(e, s.name)} (ignoré cette fois).")
@@ -1745,6 +1869,29 @@ def generate(progress=lambda *a: None, out=None, previous=None, preset="standard
     page_entries = [build_entries([g for g in games if g["store"] in {s.id for s in pst}], overrides)
                     for _, pst in page_defs]
     total_entries = sum(len(e) for e in page_entries)
+
+    # Jeux sans page de boutique (Prime Gaming, Ubisoft, listes manuelles) : page Steam du jeu en dernier recours.
+    def has_link(e):
+        return any(g.get("link") for g in e["games"])
+    need = {}
+    for pe in page_entries:
+        for e in pe:
+            if not has_link(e):
+                need.setdefault(norm_title(e["title"]), e["title"])
+    todo = [(k, t) for k, t in need.items() if k not in CTX["lookup"]]
+    if todo:
+        found, flock = [0], threading.Lock()
+
+        def look(kt):
+            r = steam_lookup(kt[1])
+            with flock:
+                found[0] += 1
+                progress("Steam : pages des jeux sans boutique", found[0], len(todo))
+            return kt[0], r
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for k, r in ex.map(look, todo):
+                if r is not None:
+                    CTX["lookup"][k] = r
 
     # Jaquettes : réutilisées depuis les anciennes pages, sinon SteamGridDB, sinon la boutique.
     sgdb = SGDB if SGDB.logged_in() else None
@@ -1851,6 +1998,14 @@ def generate(progress=lambda *a: None, out=None, previous=None, preset="standard
                 inner = (f'<a class="lnk pick" href="{html.escape(links[0]["u"], quote=True)}" '
                          f'data-links="{data}" data-title="{title}" target="_blank" '
                          f'rel="noopener noreferrer" title="Choisir le site à ouvrir">{inner}</a>')
+            else:  # aucune boutique ne propose de page pour ce jeu : page Steam (fenêtre de redirection)
+                appid = CTX["lookup"].get(norm_title(e["title"]))
+                steam_url = (f"https://store.steampowered.com/app/{appid}" if appid
+                             else "https://store.steampowered.com/search/?term=" + quote(e["title"]))
+                origin = html.escape(" + ".join(names[sid] for sid in e["stores"]))
+                inner = (f'<a class="lnk steamfb" href="{html.escape(steam_url, quote=True)}" target="_blank" '
+                         f'rel="noopener noreferrer" data-origin="{origin}" data-title="{title}" '
+                         f'data-exact="{1 if appid else 0}" title="Voir ce jeu sur Steam">{inner}</a>')
             badge = '<span class="badge">Nouveau</span>' if is_new else ""
             tag = ('<span class="tags">' + "".join(
                 f'<span class="tag {sid}">{tags[sid]}</span>' for sid in e["stores"]) + "</span>"
@@ -1885,7 +2040,8 @@ def generate(progress=lambda *a: None, out=None, previous=None, preset="standard
                  "init": sorted(({s.id for s in ok_stores} | carried_init) & kept),
                  "srcs": {k: v for k, v in srcs.items() if k in kept},
                  "epic": epic,
-                 "lookup": {k: v for k, v in CTX["lookup"].items() if k in manual_titles},
+                 "lookup": {k: v for k, v in CTX["lookup"].items()
+                            if k in manual_titles or k in {norm_title(e["title"]) for e in entries if not has_link(e)}},
                  "miss": sorted(miss | {k for k in prev["miss"] if sid_of(k) in kept - ids}),
                  "manual": {s.id: MANUAL[s.id] for s in STORES
                             if s.has_list and MANUAL.get(s.id, "").strip() and s.id in kept}}
@@ -1976,6 +2132,7 @@ input[type=text],input[type=password],textarea{width:100%;font-family:inherit;pa
 .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
 .srow{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.srow>button,.sbtns{margin-left:auto}
 .sbtns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+details{margin:10px 0}summary{cursor:pointer;color:var(--accent);font-weight:600}
 pre.snip{background:var(--bg);border:1px solid #8886;border-radius:8px;padding:10px;font-size:.78rem;white-space:pre-wrap;word-break:break-all;margin:8px 0;user-select:all}
 .store{padding:10px 0;border-top:1px solid #8883}.store:first-child{border-top:0;padding-top:0}
 .bar{height:10px;border-radius:99px;background:#8883;overflow:hidden;margin:12px 0 6px}
@@ -2056,8 +2213,11 @@ function manualBox(wrap,s){
  wrap.appendChild(ok)}
 function loginBox(wrap,s){
  const ol=el('ol');s.steps.forEach(t=>ol.appendChild(el('li',null,t)));wrap.appendChild(ol);
+ if(s.alt_steps&&s.alt_steps.length){const d=el('details'),sm=el('summary',null,s.alt_title||'Méthode alternative'),o2=el('ol');
+  d.appendChild(sm);s.alt_steps.forEach(t=>o2.appendChild(el('li',null,t)));d.appendChild(o2);wrap.appendChild(d)}
  const a=el('a','btn sec',s.kind==='key'?'Obtenir ma clé API':'Ouvrir la connexion '+s.name);
  a.href=s.auth_url;a.target='_blank';a.rel='noopener';wrap.appendChild(a);
+ (s.extra_links||[]).forEach(l=>{const b=el('a','btn sec',l.label);b.href=l.url;b.target='_blank';b.rel='noopener';wrap.appendChild(b)});
  if(s.snippet){wrap.appendChild(el('pre','snip',s.snippet));
   const cb=el('button','sec small','Copier le script');cb.onclick=()=>copyText(s.snippet,cb);wrap.appendChild(cb)}
  const err=el('p','err');
@@ -2099,7 +2259,7 @@ function renderStores(){
    b.onclick=async()=>{if(s.logged){await api('/api/logout',{store:s.id})}else{opened[s.id]=!opened[s.id]}await refresh()};bx.appendChild(b);
   }
   row.appendChild(bx);wrap.appendChild(row);
-  if(!pure&&(s.status||{}).state==='offline'&&s.status.detail)wrap.appendChild(el('p','muted',s.status.detail));
+  if(!pure&&['offline','expired'].includes((s.status||{}).state)&&s.status.detail)wrap.appendChild(el('p','muted',s.status.detail));
   if(pure){if(opened[s.id])manualBox(wrap,s)}
   else{if(!s.logged&&opened[s.id])loginBox(wrap,s);if(s.has_list&&listOpen[s.id])manualBox(wrap,s)}
   box.appendChild(wrap)});
@@ -2482,6 +2642,13 @@ def run_diagnostic():
     img_tool = (f"{t['tool']} -> {t['format']}" if t["tool"]
                 else "AUCUN (Pillow, ImageMagick ou ffmpeg requis : sans eux, images PNG/JPEG d'origine)")
     print("Réduction d'images :", img_tool)
+    print("Connexions enregistrées :", end=" ")
+    saved = [x for x in STORES + SERVICES if x.connected()]
+    print("" if saved else "(aucune)")
+    for x in saved:
+        c = x.check()  # n'envoie aucun mot de passe ; supprime les jetons d'une session expirée
+        print(f"   {x.name} : {c['state']}" + (f" ({c['user']})" if c.get("user") else "")
+              + (f" — {c['detail']}" if c.get("detail") else ""))
     print()
     targets = [("GOG (connexion)", "https://auth.gog.com/"),
                ("GOG (bibliothèque)", "https://embed.gog.com/"),
